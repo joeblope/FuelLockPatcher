@@ -102,11 +102,12 @@ class APKCombo:
         ZH = "zh"
 
     @staticmethod
-    def search(retries: int = 10):
+    def search(retries: int = 50):
         if retries <= 0:
-            return []
+            raise Exception("Failed to search for apks")
         url = f"https://apkcombo.com/my-7-eleven/au.com.fuel7eleven/download/apk"
         proxy = proxies.get_proxy("http")
+        print(f"Searching with proxy {proxy}")
         response = requests.get(url, proxies={"http": proxy})
         # response = requests.get(url)
         if response.status_code != 200:
