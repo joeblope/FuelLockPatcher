@@ -1,0 +1,250 @@
+name: Patch APK at URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        type: string
+        required: false
+        description: Url/Urls to pull an apk to patch from
+
+permissions:
+  contents: write
+
+env:
+  KEYSTORE_NAME: "decoded_keystore.jks"
+
+jobs:
+  determine-download-type:
+    runs-on: ubuntu-latest
+    outputs:
+      APK_URLS: ${{ env.apk_urls }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Check if input is valid url list with Python
+        if: "${{ inputs.apk_url != '' }}"
+        run: |
+          python3 url_parser.py -i '${{ inputs.apk_url }}'
+          # Above python sets environment variable "apk_urls" to result
+
+      - name: Search for urls
+        if: "${{ inputs.apk_url == '' }}"
+        run: |
+          python3 search_for_urls.py
+          # Above python sets environment variable "apk_urls" to result
+
+      - name: Return apk urls
+        id: result
+        run: |
+          echo "${{ env.apk_urls }}"
+
+  patch:
+    needs: determine-download-type
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        apk_url: ${{ fromJson(needs.determine-download-type.outputs.APK_URLS) }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 22
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'oracle'
+        java-version: '22'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        packages: 'build-tools;35.0.0'
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: List install packages locations
+      run: |
+        sdkmanager --list
+
+    - name: Add paths to environment variables
+      run: |
+        echo "JAVA_BIN=${{ env.JAVA_HOME }}/bin/java" >> $GITHUB_ENV
+        echo "KEYTOOL_BIN=${{ env.JAVA_HOME }}/bin/keytool" >> $GITHUB_ENV
+        echo "APKSIGNER_BIN=${{ env.ANDROID_SDK_ROOT }}/build-tools/35.0.0/apksigner" >> $GITHUB_ENV
+        echo "ZIPALIGN_BIN=${{ env.ANDROID_SDK_ROOT }}/build-tools/35.0.0/zipalign" >> $GITHUB_ENV
+        echo "AAPT2_BIN=${{ env.ANDROID_SDK_ROOT }}/build-tools/35.0.0/aapt2" >> $GITHUB_ENV
+
+    - name: Download APK
+      id: download_apk
+      run: |
+        python3 download_apk.py --url "${{ matrix.apk_url }}"
+        # Above python sets output variable "apk_file_name" to the downloaded apk file name
+
+    - name: Get APK Package Info
+      id: original_apk_info
+      run: |
+        python3 APK_Info.py -i "${{ steps.download_apk.outputs.apk_file_name }}"
+        # Sets output variables:
+          #apk_version
+          #apk_package_name
+          #apk_version_code
+          #apk_min_sdk_version
+          #apk_target_sdk_version
+          #apk_app_name
+          #apk_architectures
+          #apk_densities
+          #apk_type
+
+    - name: Check if release exists
+      id: check_release
+      run: |
+        TAG="${{ steps.original_apk_info.outputs.apk_version }}"
+        if git show-ref --tags --verify --quiet "refs/tags/${TAG}"; then
+          echo "Tag ${TAG} exists"
+          echo "release_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Tag ${TAG} does not exist"
+          echo "release_exists=false" >> $GITHUB_OUTPUT
+        fi
+    - name: Retrieve the keystore secret and decode it into a file
+      env:
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      run: |
+        echo $KEYSTORE_BASE64 | base64 --decode > "${{ env.KEYSTORE_NAME }}"
+
+    - name: Patch APK
+      if: steps.check_release.outputs.release_exists == 'false'
+      id: patch_apk
+      env:
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+
+      run: |
+        output_name="${{ steps.original_apk_info.outputs.apk_package_name }}_${{ steps.original_apk_info.outputs.apk_version }}"
+        output_file_name="${output_name}_modded.apk"
+
+        python3 XAPK_patcher.py -i "${{ steps.download_apk.outputs.apk_file_name }}" -o "$output_file_name"
+
+        echo "patched_name=$output_name" >> $GITHUB_OUTPUT
+        echo "patched_apk_file_name=$output_file_name" >> $GITHUB_OUTPUT
+
+
+    - name: Get Patched APK Package Info
+      id: patched_apk_info
+      run: |
+          python3 APK_Info.py -i "${{ steps.patch_apk.outputs.patched_apk_file_name }}"
+          # Sets output variables:
+          #apk_version
+          #apk_package_name
+          #apk_version_code
+          #apk_min_sdk_version
+          #apk_target_sdk_version
+          #apk_app_name
+          #apk_architectures
+          #apk_densities
+          #apk_type
+
+    - name: Create Release Notes
+      if: steps.check_release.outputs.release_exists == 'false'
+      run: |
+        echo "### Autogenerated ${{ steps.patch_apk.outputs.patched_apk_file_name }}" >> release_notes.txt
+
+        echo "" >> release_notes.txt
+
+        # APK ARCHITECTURES
+        original_archs="${{ steps.original_apk_info.outputs.apk_architectures }}"
+        patched_archs="${{ steps.patched_apk_info.outputs.apk_architectures }}"
+        if [ -n "$original_archs" ] && [ "$original_archs" != "$patched_archs" ]; then
+            echo "- **Original APK Supported ABIs**: \`$original_archs\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Supported ABIs**: \`$patched_archs\`" >> release_notes.txt
+
+        # APK TYPE
+        original_type="${{ steps.original_apk_info.outputs.apk_type }}"
+        patched_type="${{ steps.patched_apk_info.outputs.apk_type }}"
+        if [ -n "$original_type" ] && [ "$original_type" != "$patched_type" ]; then
+            echo "- **Original APK Type**: \`$original_type\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Type**: \`$patched_type\`" >> release_notes.txt
+
+        # APK DENSITIES
+        original_densities="${{ steps.original_apk_info.outputs.apk_densities }}"
+        patched_densities="${{ steps.patched_apk_info.outputs.apk_densities }}"
+        if [ -n "$original_densities" ] && [ "$original_densities" != "$patched_densities" ]; then
+            echo "- **Original APK Supported Densities**: \`$original_densities\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Supported Densities**: \`$patched_densities\`" >> release_notes.txt
+
+        # APK MIN SDK VERSION
+        original_min_sdk="${{ steps.original_apk_info.outputs.apk_min_sdk_version }}"
+        patched_min_sdk="${{ steps.patched_apk_info.outputs.apk_min_sdk_version }}"
+        if [ -n "$original_min_sdk" ] && [ "$original_min_sdk" != "$patched_min_sdk" ]; then
+            echo "- **Original APK Min SDK Version**: \`$original_min_sdk\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Min SDK Version**: \`$patched_min_sdk\`" >> release_notes.txt
+
+        # APK TARGET SDK VERSION
+        original_target_sdk="${{ steps.original_apk_info.outputs.apk_target_sdk_version }}"
+        patched_target_sdk="${{ steps.patched_apk_info.outputs.apk_target_sdk_version }}"
+        if [ -n "$original_target_sdk" ] && [ "$original_target_sdk" != "$patched_target_sdk" ]; then
+            echo "- **Original APK Target SDK Version**: \`$original_target_sdk\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Target SDK Version**: \`$patched_target_sdk\`" >> release_notes.txt
+
+        # APK VERSION CODE
+        original_version_code="${{ steps.original_apk_info.outputs.apk_version_code }}"
+        patched_version_code="${{ steps.patched_apk_info.outputs.apk_version_code }}"
+        if [ -n "$original_version_code" ] && [ "$original_version_code" != "$patched_version_code" ]; then
+            echo "- **Original APK Version Code**: \`$original_version_code\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Version Code**: \`$patched_version_code\`" >> release_notes.txt
+
+        # APK VERSION
+        original_version="${{ steps.original_apk_info.outputs.apk_version }}"
+        patched_version="${{ steps.patched_apk_info.outputs.apk_version }}"
+        if [ -n "$original_version" ] && [ "$original_version" != "$patched_version" ]; then
+            echo "- **Original APK Version**: \`$original_version\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK Version**: \`$patched_version\`" >> release_notes.txt
+
+        # APK APP NAME
+        original_app_name="${{ steps.original_apk_info.outputs.apk_app_name }}"
+        patched_app_name="${{ steps.patched_apk_info.outputs.apk_app_name }}"
+        if [ -n "$original_app_name" ] && [ "$original_app_name" != "$patched_app_name" ]; then
+            echo "- **Original APK App Name**: \`$original_app_name\`" >> release_notes.txt
+        fi
+        echo "- **Patched APK App Name**: \`$patched_app_name\`" >> release_notes.txt
+
+
+    - name: Create release
+      if: steps.check_release.outputs.release_exists == 'false'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        tag: ${{ steps.patched_apk_info.outputs.apk_version }}
+      run: |
+        gh release create "$tag" \
+            "${{ steps.patch_apk.outputs.patched_apk_file_name }}" \
+            --title="${{ steps.patch_apk.outputs.patched_name }} Patched Release" \
+            --notes-file="release_notes.txt" \
