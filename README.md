@@ -6,4 +6,4 @@ Automatically downloads apks and patches out mock location checks
 # Releases
 Releases are automatically generated based on new versions of the 7Eleven app.
 
-You can find the latest releases in the [Releases](/releases) section
+You can find the latest releases in the [Releases](https://github.com/joeblope/FuelLockPatcher/releases) section
