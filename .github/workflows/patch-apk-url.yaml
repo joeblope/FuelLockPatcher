@@ -155,6 +155,7 @@ jobs:
 
 
     - name: Get Patched APK Package Info
+      if: steps.check_release.outputs.release_exists == 'false'
       id: patched_apk_info
       run: |
           python3 APK_Info.py -i "${{ steps.patch_apk.outputs.patched_apk_file_name }}"
