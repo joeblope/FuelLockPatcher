@@ -2,8 +2,8 @@ name: Patch APK at URL
 
 on:
   schedule:
-    # Trigger at 14:10 UTC every day
-    - cron: '10 14 * * *'
+    # Trigger at 02:10, 08:10, 14:10, and 20:10 UTC every day
+    - cron: '10 2,8,14,20 * * *'
   workflow_dispatch:
     inputs:
       apk_url:
